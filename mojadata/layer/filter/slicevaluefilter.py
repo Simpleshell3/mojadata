@@ -18,7 +18,7 @@ class SliceValueFilter(object):
         self._target_val = target_val
         self._pos = slice_pos
         self._len = slice_len
-        
+
     def __call__(self, val):
         '''
         Evaluates the filter against a value.

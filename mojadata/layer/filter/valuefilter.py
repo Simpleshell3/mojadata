@@ -10,7 +10,7 @@ class ValueFilter(object):
 
     def __init__(self, target_val, *args, **kwargs):
         self._target_val = target_val
-        
+
     def __call__(self, val):
         '''
         Evaluates the filter against a value.

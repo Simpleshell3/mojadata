@@ -1,6 +1,7 @@
 ﻿import os
 import uuid
 from future.utils import viewitems
+from mojadata.util.gdal_calc import Calc
 from mojadata.util import gdalconst
 from mojadata.util import gdal
 from mojadata.util.validationhelper import ValidationHelper
@@ -8,7 +9,8 @@ from mojadata.util.gdalhelper import GDALHelper
 from mojadata.config import (
     GDAL_MEMORY_LIMIT,
     GDAL_WARP_OPTIONS,
-    GDAL_WARP_CREATION_OPTIONS
+    GDAL_WARP_CREATION_OPTIONS,
+    GDAL_CREATION_OPTIONS
 )
 from mojadata.layer.layer import Layer
 from mojadata import cleanup
@@ -105,12 +107,11 @@ class RasterLayer(Layer):
         warp_path = os.path.join(tmp_dir, "warp_{}.tif".format(self._name))
         gdal.Warp(warp_path, self._path,
                   targetAlignedPixels=True,
-                  multithread=True,
                   dstSRS=srs,
                   xRes=requested_pixel_size or min_pixel_size,
                   yRes=requested_pixel_size or min_pixel_size,
                   warpMemoryLimit=GDAL_MEMORY_LIMIT,
-                  options=GDAL_WARP_OPTIONS,
+                  options=GDAL_WARP_OPTIONS.copy(),
                   creationOptions=GDAL_WARP_CREATION_OPTIONS,
                   outputBounds=bounds)
 
@@ -131,16 +132,35 @@ class RasterLayer(Layer):
 
         gdal.Warp(output_path, warp_path,
                   targetAlignedPixels=True,
-                  multithread=True,
                   xRes=pixel_size, yRes=pixel_size,
                   outputType=output_type,
                   dstNodata=self._nodata_value,
                   warpMemoryLimit=GDAL_MEMORY_LIMIT,
-                  options=GDAL_WARP_OPTIONS,
+                  options=GDAL_WARP_OPTIONS.copy(),
                   creationOptions=GDAL_WARP_CREATION_OPTIONS)
+
+        self._drop_nulls(output_path)
 
         return RasterLayer(output_path, self._attributes, self._attribute_table,
                            date=self._date, tags=self._tags, allow_nulls=self._allow_nulls)
+
+    def _drop_nulls(self, path):
+        # If this layer has an attribute table attached, drop any pixel values
+        # that have been left out of it.
+        if not self._attribute_table:
+            return
+
+        calc = " + ".join((
+            f"isin(A, {list(self._attribute_table.keys())}) * A",
+            f"isin(A, {list(self._attribute_table.keys())}, invert=True) * {self._nodata_value}"
+        ))
+
+        tmp_path = os.path.join(os.path.dirname(path), f"{os.path.basename(path)}_drop_nulls.tiff")
+        os.rename(path, tmp_path)
+        Calc(calc, path, self._nodata_value, creation_options=GDAL_CREATION_OPTIONS,
+             A=tmp_path, overwrite=True, quiet=True)
+
+        os.remove(tmp_path)
 
     def _get_nearest_divisible_resolution(self, min_pixel_size, requested_pixel_size, block_extent):
         nearest_block_divisible_size = \

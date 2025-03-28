@@ -1,8 +1,13 @@
-﻿import logging
+﻿import os
+import uuid
+import logging
 from future.utils import viewitems
+from mojadata import cleanup
 from mojadata.layer.layer import Layer
 from mojadata.layer.rasterlayer import RasterLayer
 from mojadata.layer.attribute import Attribute
+from mojadata.config import GDAL_CREATION_OPTIONS
+from mojadata.util.gdal_calc import Calc
 
 
 class DisturbanceLayer(Layer):
@@ -79,9 +84,58 @@ class DisturbanceLayer(Layer):
 
     @property
     def attribute_table(self):
+        return self._build_attribute_table(self._layer)
+
+    def is_empty(self):
+        return self._layer.is_empty()
+
+    def _rasterize(self, srs, min_pixel_size, block_extent, requested_pixel_size=None,
+                   data_type=None, bounds=None):
+        raster, messages = self._layer.as_raster_layer(
+            srs, min_pixel_size, block_extent, requested_pixel_size,
+            data_type, bounds)
+
+        self.messages = messages
+        if not raster:
+            return None
+
+        if not self._layer.attributes:
+            raster = self._flatten(raster)
+
+        # Handle the situation where a raster with no user-provided interpretation
+        # is used as a disturbance layer, in which case we use all non-nodata pixel
+        # values.
+        attribute_table = (
+            self.attribute_table if self._layer.attributes
+            else self._build_attribute_table(raster)
+        )
+
+        if not attribute_table:
+            return None
+
+        # Layer might also include some extra attributes that aren't part of the
+        # core disturbance attributes, but make up some additional metadata used
+        # by specific modules.
+        disturbance_attributes = [attr.db_name for attr in (
+            self._year, self._disturbance_type) if isinstance(attr, Attribute)]
+
+        if self._transition:
+            disturbance_attributes.extend([attr.db_name for attr in (
+                self._transition.regen_delay, self._transition.age_after)
+                if isinstance(attr, Attribute)])
+
+            if isinstance(self._transition.classifiers, list):
+                disturbance_attributes.extend(self._transition.classifiers)
+
+        self._metadata_attributes = list(set(raster.attributes) - set(disturbance_attributes))
+
+        return RasterLayer(raster.path, self.attributes, attribute_table, tags=self.tags)
+
+    def _build_attribute_table(self, layer):
         attr_table = {}
-        for pixel_value, attr_values in viewitems(self._layer.attribute_table):
-            attr_values = dict(zip(self._layer.attributes, attr_values))
+
+        for pixel_value, attr_values in viewitems(layer.attribute_table):
+            attr_values = dict(zip(layer.attributes, attr_values))
 
             for required_attr in [
                 attr.db_name for attr in (self._year, self._disturbance_type)
@@ -112,8 +166,8 @@ class DisturbanceLayer(Layer):
                     regen_delay, age_after, transition_values)
 
             values = [
-                attr_values.get(self._year.db_name)
-                if isinstance(self._year, Attribute) else self._year,
+                int(float(attr_values.get(self._year.db_name)))
+                if isinstance(self._year, Attribute) else int(float(self._year)),
                 attr_values.get(self._disturbance_type.db_name)
                 if isinstance(self._disturbance_type, Attribute) else self._disturbance_type]
 
@@ -130,33 +184,15 @@ class DisturbanceLayer(Layer):
 
         return attr_table
 
-    def is_empty(self):
-        return self._layer.is_empty()
+    def _flatten(self, layer):
+        tmp_dir = "_".join((os.path.abspath(layer.name), str(uuid.uuid1())[:4]))
+        if not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
 
-    def _rasterize(self, srs, min_pixel_size, block_extent, requested_pixel_size=None,
-                   data_type=None, bounds=None):
-        raster, messages = self._layer.as_raster_layer(
-            srs, min_pixel_size, block_extent, requested_pixel_size,
-            data_type, bounds)
+        cleanup.register_temp_dir(tmp_dir)
+        nodata = layer.nodata_value
+        output_path = os.path.join(tmp_dir, layer.name)
+        Calc("A != {}".format(nodata), output_path, nodata_value=nodata,
+             creation_options=GDAL_CREATION_OPTIONS, A=layer.path, quiet=True)
 
-        self.messages = messages
-        if not raster or not self.attribute_table:
-            return None
-
-        # Layer might also include some extra attributes that aren't part of the
-        # core disturbance attributes, but make up some additional metadata used
-        # by specific modules.
-        disturbance_attributes = [attr.db_name for attr in (
-            self._year, self._disturbance_type) if isinstance(attr, Attribute)]
-
-        if self._transition:
-            disturbance_attributes.extend([attr.db_name for attr in (
-                self._transition.regen_delay, self._transition.age_after)
-                if isinstance(attr, Attribute)])
-
-            if isinstance(self._transition.classifiers, list):
-                disturbance_attributes.extend(self._transition.classifiers)
-
-        self._metadata_attributes = list(set(raster.attributes) - set(disturbance_attributes))
-
-        return RasterLayer(raster.path, self.attributes, self.attribute_table, tags=self.tags)
+        return RasterLayer(output_path, ["disturbed"], {1: [1]}, name=layer.name)

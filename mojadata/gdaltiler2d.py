@@ -1,17 +1,12 @@
 ﻿import os
-import zipfile
 import logging
 import traceback
-from io import BytesIO
 from mojadata.util.log import get_logger
 from future.utils import viewitems
-from zipfile import ZipFile
 from mojadata.util import gdal
 from mojadata.tiler import Tiler
 from mojadata.cleanup import cleanup
-from mojadata.config import (
-    GDAL_MEMORY_LIMIT
-)
+from mojadata.config import GDAL_MEMORY_LIMIT
 
 class GdalTiler2D(Tiler):
     '''
@@ -37,7 +32,9 @@ class GdalTiler2D(Tiler):
     '''
 
     def __init__(self, bounding_box, tile_extent=1.0, block_extent=0.1,
-                 use_bounding_box_resolution=False, compact_attribute_table=False):
+                 use_bounding_box_resolution=False, compact_attribute_table=False,
+                 **kwargs):
+        super().__init__(**kwargs)
         self._log = get_logger(self.__class__)
         self._bounding_box = bounding_box
         self._tile_extent = tile_extent
@@ -168,14 +165,14 @@ def _write_metadata(layer, config, path):
             metadata["attributes"] = layer.attribute_table
         else:
             attributes = {}
-            native_attributes = ["null"]
+            native_attributes = ["null" for _ in range(max((int(px) for px in layer.attribute_table)) + 1)]
             for pixel_value, attr_values in viewitems(layer.attribute_table):
                 if len(attr_values) == 1:
                     attributes[pixel_value] = attr_values[0]
-                    native_attributes.append(str(attr_values[0]))
+                    native_attributes[int(pixel_value)] = str(attr_values[0])
                 else:
                     attributes[pixel_value] = dict(zip(layer.attributes, attr_values))
-                    native_attributes.append(repr([str(v) for v in attr_values]))
+                    native_attributes[int(pixel_value)] = repr([str(v) for v in attr_values])
 
             metadata["attributes"] = attributes
             _write_native_attribute_table(layer.path, native_attributes)

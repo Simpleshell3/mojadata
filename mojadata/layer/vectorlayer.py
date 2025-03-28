@@ -54,19 +54,19 @@ class VectorLayer(Layer):
                  data_type=None, layer=None, date=None, tags=None, allow_nulls=False):
         super(self.__class__, self).__init__()
         ValidationHelper.require_path(path)
+        attributes = [attributes] if isinstance(attributes, Attribute) else attributes
         self._name = name
         self._data_type = data_type
         self._nodata_value = nodata_value
-        self._path = os.path.abspath(path)
+        self._path = os.path.abspath(path) if not path.startswith("PG:") else path
         self._layer = layer
         self._raw = raw
         self._date = date
-        self._id_attribute = "value_id" if not raw else attributes.name
+        self._id_attribute = "value_id" if not raw else attributes[0].name
         self._attribute_table = {}
         self._tags = tags or []
         self._allow_nulls = allow_nulls
-        self._attributes = [attributes] if isinstance(attributes, Attribute) \
-                                        else attributes
+        self._attributes = attributes
 
     @property
     def name(self):
@@ -133,14 +133,25 @@ class VectorLayer(Layer):
             self.add_message((logging.WARN, "No features remaining in the study area - resolution may be too coarse."))
             return None
 
+        where_clause = "{} IS NOT NULL".format(self._id_attribute)
         if not self._raw:
             self._build_attribute_table(reproj_path)
+        else:
+            if self._attributes[0].has_filter:
+                filtered_values = self._build_raw_filter(reproj_path)
+                if not filtered_values:
+                    self.add_message((logging.WARN, "{} has no unfiltered values - skipping".format(self._name)))
+                    return None
+
+                where_clause += " AND CAST({} AS STR) IN ({})".format(
+                    self._id_attribute,
+                    ",".join(("'{}'".format(v) for v in filtered_values)))
 
         clip_path = os.path.join(tmp_dir, self._make_name("_clip.db"))
         gdal.VectorTranslate(clip_path, reproj_path, format="SQLite",
                              options=base_ogr2ogr_opts + [
             "-select", self._id_attribute,
-            "-where", "{} IS NOT NULL".format(self._id_attribute)])
+            "-where", where_clause])
 
         # Check that some geometry actually made it through the filtering process - calling
         # gdal.Rasterize on an empty vector layer will cause a hard crash in GDAL.
@@ -170,7 +181,7 @@ class VectorLayer(Layer):
             noData=self._nodata_value,
             creationOptions=GDAL_RASTERIZE_CREATION_OPTIONS,
             targetAlignedPixels=True,
-            options=GDAL_RASTERIZE_OPTIONS \
+            options=GDAL_RASTERIZE_OPTIONS.copy() \
                 + ["-ot", GDALHelper.type_code_lookup.get(self._data_type) or "Float32"])
 
         return RasterLayer(tmp_raster_path, self.attributes, self._attribute_table,
@@ -213,6 +224,50 @@ class VectorLayer(Layer):
 
     def _make_name(self, ext=""):
         return "{}{}".format(self._name, ext)
+
+    def _find_table_name(self, path):
+        ValidationHelper.require_path(path)
+        ds = ogr.Open(path, 1)
+        if not ds:
+            raise IOError("Error reading file: {}".format(path))
+
+        try:
+            base_filename = os.path.splitext(os.path.basename(self._path))[0].lower()
+            all_tables = ds.ExecuteSQL("SELECT name FROM sqlite_master WHERE type = 'table';")
+            matching_table = None
+            for row in all_tables:
+                table_name = row.GetField(0).lower()
+                if table_name in base_filename or table_name in (self._layer.lower() or ""):
+                    matching_table = table_name
+                    break
+
+            ds.ReleaseResultSet(all_tables)
+            return matching_table
+        finally:
+            ds = None
+
+    def _build_raw_filter(self, path):
+        ValidationHelper.require_path(path)
+        ds = ogr.Open(path, 1)
+        if not ds:
+            raise IOError("Error reading file: {}".format(path))
+
+        try:
+            filtered_values = []
+            table = self._find_table_name(path)
+            unique_values = ds.ExecuteSQL("SELECT DISTINCT {} FROM {}".format(self._id_attribute, table))
+            for row in unique_values:
+                row_value = row.GetField(0)
+                if self._attributes[0].filter(row_value):
+                    filtered_values.append(row_value)
+
+            ds.ReleaseResultSet(unique_values)
+
+            return filtered_values
+        except Exception as e:
+            self.add_message((logging.ERROR, "Error in {}: {}".format(path, e)))
+        finally:
+            ds = None
 
     def _build_attribute_table(self, path):
         ValidationHelper.require_path(path)
@@ -299,8 +354,12 @@ class VectorLayer(Layer):
             layer_def = layer.GetLayerDefn()
             field_idx = layer_def.GetFieldIndex(self._id_attribute)
             field = layer_def.GetFieldDefn(field_idx)
-            field_type_code = field.GetType()
             field_type_name = field.GetTypeName().lower()
+
+            # Kludge for fields of type "real", which are often floats, sometimes
+            # getting a UInt type code in GetType().
+            field_type_code = gdal.GDT_Float32 if field_type_name == "real" else field.GetType()
+
             field_type_code_family = gdal.GDT_Int32 if "int" in field_type_name else gdal.GDT_Float32
             return field_type_code or field_type_code_family
         except:
@@ -310,11 +369,11 @@ class VectorLayer(Layer):
 
     @staticmethod
     def is_empty_layer(path, layer=0):
-        if not os.path.exists(path):
+        if not path.startswith("PG:") and not os.path.exists(path):
             return True
 
         ds = ogr.Open(path, 0)
-        if not ds:
+        if ds is None:
             return True
 
         try:

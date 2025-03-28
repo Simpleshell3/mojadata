@@ -13,7 +13,7 @@ with open(path.join(here, "readme.rst"), encoding="utf8") as f:
 
 setup(
     name="mojadata",
-    version="3.7.1",
+    version="4.1.5",
     description="Mojadata Tiler",
     long_description=long_description,
     url="https://github.com/SLEEK-TOOLS/moja.data",
